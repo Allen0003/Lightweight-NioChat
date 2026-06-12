@@ -74,71 +74,94 @@ public class ChatServer {
 
     private void handleAccept(SelectionKey key) {
         try {
-            // 1. 從 SelectionKey 中獲取原先的 ServerSocketChannel
             ServerSocketChannel serverChannel = (ServerSocketChannel) key.channel();
-
-            // 2. 接受客戶端的連線（此時建立 TCP 三向交握）
-            // 因為 ServerSocketChannel 是非阻塞的，若無連線此處會回傳 null，但既然 key.isAcceptable() 成立，這裡一定有連線
             SocketChannel clientChannel = serverChannel.accept();
-
-            // 3. 關鍵：一定要將客戶端通道也設為非阻塞
             clientChannel.configureBlocking(false);
 
-            // 4. 將客戶端通道註冊到同一個 Selector，開始監聽「可讀（OP_READ）」事件
-            // 我們可以順便附帶一個物件（Attachment）作為這個通道的識別，這裡先附帶客戶端的遠端地址
-            clientChannel.register(this.selector, SelectionKey.OP_READ, clientChannel.getRemoteAddress());
-
+            // 核心改動：為這個客戶端配置一個 2KB 的專屬暫存區，並作為 Attachment 掛載
+            // 預設為「寫入模式」
+            ByteBuffer clientBuffer = ByteBuffer.allocate(2048);
+            clientChannel.register(this.selector, SelectionKey.OP_READ, clientBuffer);
             System.out.println("成功連線來自客戶端: " + clientChannel.getRemoteAddress());
-
         } catch (IOException e) {
             System.err.println("處理新連線時發生異常: " + e.getMessage());
         }
     }
 
     private void handleRead(SelectionKey key) {
-        // 1. 從 SelectionKey 中獲取觸發事件的客戶端通道
         SocketChannel clientChannel = (SocketChannel) key.channel();
-        // 2. 分配一個 1024 位元組的緩衝區
-        ByteBuffer buffer = ByteBuffer.allocate(1024);
+        // 1. 拿回這個連線專屬的持久型暫存區 (此時 buffer 處於寫入模式)
+        ByteBuffer buffer = (ByteBuffer) key.attachment();
         try {
-            // 3. 從通道讀取資料到 Buffer 中
+            // 2. 將網路線上的新資料追加 (Append) 到暫存區中
             int bytesRead = clientChannel.read(buffer);
-
-            // 如果回傳 -1，代表客戶端主動斷開連線（完成了 TCP 四次揮手）
             if (bytesRead == -1) {
                 disconnect(key, clientChannel);
                 return;
             }
 
-            // 4. 關鍵！切換 Buffer 為「讀取模式」（倒帶）
-            buffer.flip();
+            // 3. 進入滾動式拆包迴圈。因為可能一次黏了很多條訊息，我們必須用 while 榨乾它
+            while (true) {
+                // 切換成「讀取模式」來檢查裡面的資料
+                buffer.flip();
 
-            // 5. 將 Buffer 中的位元組轉換為字串
-            String message = StandardCharsets.UTF_8.decode(buffer).toString();
-            String clientAddress = key.attachment().toString(); // 拿回當初 accept 時附帶的地址
+                // 狀況 A：如果連 4 位元組的長度標頭都不夠，代表資料還太少
+                if (buffer.remaining() < 4) {
+                    // 還原成「寫入模式」，保留現有資料，等下一次 OP_READ 觸發
+                    buffer.compact();
+                    break;
+                }
+                // 標記目前位置，如果等一下發現內容不夠（半包），可以回滾
+                buffer.mark();
 
-            System.out.println("[" + clientAddress + "]: " + message.trim());
+                // 讀取前 4 碼，得知後面本文的預期長度
+                int messageLength = buffer.getInt();
 
-            // 6. 廣播給其他所有在線的客戶端
-            broadcast(message, clientChannel);
+                // 狀況 B：如果剩下的資料小於本文預期長度（發生半包）
+                if (buffer.remaining() < messageLength) {
+                    // 回滾到 mark 的位置（把剛剛 readInt 消耗掉的 4 位元組吐回去）
+                    buffer.reset();
+                    // 還原成「寫入模式」，保留現有資料，等下一次網路資料進來
+                    buffer.compact();
+                    break;
+                }
 
+                // 狀況 C：資料夠了！精準截取指定長度的位元組
+                byte[] bodyBytes = new byte[messageLength];
+                buffer.get(bodyBytes); // 從 buffer 讀出本文
+
+                String message = new String(bodyBytes, StandardCharsets.UTF_8);
+                System.out.println("來自 [" + clientChannel.getRemoteAddress() + "] 的完整訊息: " + message.trim());
+
+                // 廣播給其他人
+                broadcast(message, clientChannel);
+                // 核心關鍵：將已經處理完的資料剔除，未處理的資料（粘包的下一條）移到最前面
+                // compact() 會自動把 position 設在未處理資料的後面，讓 buffer 回到「寫入模式」
+                buffer.compact();
+                // 繼續 while 迴圈，檢查緊跟在後面的下一條訊息是不是也是完整的
+            }
         } catch (IOException e) {
-            // 發生異常（例如客戶端強行關閉），進行斷開處理
             disconnect(key, clientChannel);
         }
     }
 
     private void broadcast(String message, SocketChannel excludeChannel) {
-        // 取得目前 Selector 監管的所有通道金鑰
+        byte[] bodyBytes = message.getBytes(StandardCharsets.UTF_8);
+        int totalLength = bodyBytes.length;
+
+        // 分配一個剛好容納 [4位元組長度標頭 + 本文] 的 Buffer
+        ByteBuffer writeBuffer = ByteBuffer.allocate(4 + totalLength);
+        writeBuffer.putInt(totalLength); // 先寫入 4 碼長度
+        writeBuffer.put(bodyBytes);      // 再寫入本文
+        writeBuffer.flip();              // 切換為讀取模式以供寫出
+
         for (SelectionKey key : selector.keys()) {
-            // 我們只想廣播給「客戶端通道」，必須排除 ServerSocketChannel 自己和發送者自己
             if (key.isValid() && key.channel() instanceof SocketChannel) {
                 SocketChannel targetChannel = (SocketChannel) key.channel();
                 if (targetChannel != excludeChannel) {
                     try {
-                        // 將字串包裝成 ByteBuffer
-                        ByteBuffer writeBuffer = ByteBuffer.wrap(message.getBytes(StandardCharsets.UTF_8));
-                        // 直接寫入通道發送
+                        // 為了確保完整寫出，重置 writeBuffer 的 position 到開頭
+                        writeBuffer.rewind();
                         targetChannel.write(writeBuffer);
                     } catch (IOException e) {
                         e.printStackTrace();
