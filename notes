@@ -1,0 +1,100 @@
+
+Java NIO 的核心就在於三大元件：
+
+non block i/o
+
+
+Selector （選擇器）
+Channel （通道）
+Buffer （緩衝區）
+
+
+SelectionKey 是 Java NIO 原生的類別： 它代表的是一個「通道（Channel）」與「選擇器（Selector）」之間的註冊關係標記。
+
+小問題
+
+1. 為什麼 keyIterator.remove(); 這麼重要？ 如果我們處理完了這個事件，卻沒有把 key 從 selectedKeys 集合中移除，下一次 selector.select() 呼叫時會發生什麼事？
+
+如果你不手動 remove()，下一次迴圈進來，這個 key 依然存在於集合中。此時你的程式會再次嘗試對它進行處理
+
+
+2. selector.select() 的阻塞行為
+當沒有任何網路事件發生時，這個 select() 呼叫會釋放 CPU 資源。你知道它在 Linux 底層對應的是哪一個系統呼叫（System Call）嗎？
+
+epoll 則是主動通知機制（事件驅動）核心（Kernel）會透過中斷機制直接喚醒執行緒，時間複雜度是優雅的 O(1)。
+
+
+3. 非阻塞的切換
+程式碼中的 serverSocketChannel.configureBlocking(false); 如果漏掉了，會發生什麼慘劇？
+
+那麼當你調用 read() 或 write() 時，執行緒就會死死地卡在那裡，直到有資料進來, 你的單執行緒 Event Loop 就會被徹底凍結
+
+
+
+ByteBuffer 內部有三個非常古怪的指針變數： position, limit, capacity。
+
+上面的問題 然後跟我說接下去要幹嘛
+
+4. 當我們從通道讀入資料到 Buffer 後，如果要從 Buffer 取出資料寫入字串，必須呼叫一個叫 buffer.flip() 的方法。
+
+你知道為什麼非得 flip()（翻轉）不可嗎？如果不 flip()，我們會讀到什麼東西？想一下，我們接著實作讀取與廣播邏輯！
+
+
+position（當前位置）
+capacity（容量）
+limit（界限）
+
+step 1:
+
+position = 0（水管放在最底部，準備加水）
+limit = capacity = 100（因為是空杯，最多可以加水加到滿 100ml）
+
+step 2:
+
+網路線送來了 20ml 的資料。這時水加進去了：
+
+position 跑到 20（因為加了 20ml 的水，水管現在停在刻度 20 的表面）
+limit 依然在 100。
+
+step 3:
+
+Java 的規定是：「從目前的 position 喝到 limit」。
+當你呼叫 flip()
+
+limit = position (把准許線降到 20)
+position = 0 (把吸管插回最底部 0)
+
+flip() 的本質就是：「停止加水，準備從頭開始喝水」 的切換動作。
+
+
+剛剛的client 是 單執行緒的 Selector 來同時管理「控制台輸入」和「網路讀寫」 嗎
+
+下面問題
+
+
+5. 半包與粘包問題（Packet Fragmentation / Sticky Packets）
+在剛才的 handleRead 中，我們很大方地 ByteBuffer.allocate(1024)，並且預設「一次 read() 就剛好是一條完整的聊天訊息」。
+
+但在真實的網際網路（TCP）中，TCP 是串流協議（Stream），它不保證訊息邊界。如果某個用戶手速極快，連續發送了兩條訊息，伺服器可能一次 read() 就把兩條訊息黏在一起讀出來了（粘包）；或者一條很長的訊息被拆成了兩半，伺服器第一次唯讀到了前半段（半包）。
+
+你現在能想像，如果要解決這個底層的「粘包/半包」問題，讓聊天室百分之百穩定，我們的 ByteBuffer 讀取邏輯應該要怎麼優化嗎？（提示：長度編碼或特殊結束符號）。
+
+半包 只讀取到一部分
+粘包 跟另一個一起讀出來
+
+
+用「長度欄位解碼器」（Length-Field Based Frame Decoder）
+
+
+掛載緩衝區：在 handleAccept 時，我們不要只掛載字串地址，而是掛載一個自定義的 Session 物件或一個動態的 ByteBuffer 作為暫存區（Attachment）。
+
+TCP 協議（Transmission Control Protocol） 的核心特性。
+有序性（Ordering） 串流性（Stream）
+
+
+
+
+
+
+
+
