@@ -88,6 +88,7 @@ public class ChatServer {
         }
     }
 
+    //根據接收的key 去讀取資料 SelectionKey 是 Java NIO 原生的類別： 它代表的是一個「通道（Channel）」與「選擇器（Selector）」之間的註冊關係標記。
     private void handleRead(SelectionKey key) {
         SocketChannel clientChannel = (SocketChannel) key.channel();
         // 1. 拿回這個連線專屬的持久型暫存區 (此時 buffer 處於寫入模式)
@@ -99,12 +100,10 @@ public class ChatServer {
                 disconnect(key, clientChannel);
                 return;
             }
-
             // 3. 進入滾動式拆包迴圈。因為可能一次黏了很多條訊息，我們必須用 while 榨乾它
             while (true) {
                 // 切換成「讀取模式」來檢查裡面的資料
                 buffer.flip();
-
                 // 狀況 A：如果連 4 位元組的長度標頭都不夠，代表資料還太少
                 if (buffer.remaining() < 4) {
                     // 還原成「寫入模式」，保留現有資料，等下一次 OP_READ 觸發
@@ -116,7 +115,6 @@ public class ChatServer {
 
                 // 讀取前 4 碼，得知後面本文的預期長度
                 int messageLength = buffer.getInt();
-
                 // 狀況 B：如果剩下的資料小於本文預期長度（發生半包）
                 if (buffer.remaining() < messageLength) {
                     // 回滾到 mark 的位置（把剛剛 readInt 消耗掉的 4 位元組吐回去）
